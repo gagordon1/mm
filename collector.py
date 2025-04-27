@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """
 collector.py – ETH/USDC best-bid/ask printer + Parquet logger using ccxt.pro
@@ -24,18 +23,18 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import ccxt.pro as ccxt
-from symbol_map import SYMBOL_MAP
+from control import SYMBOL_MAP, EXCHANGES
 import websockets
 import json
 import time
 
-# ─────────── configuration ───────────
+# ─────────── Globals (potentially redefined by args) ───────────
+SYMBOL = 'ETH/USDC' # Default
+SUBPATH = 'ETH-USDC' # Default
+OUT = pathlib.Path(f"data/{SUBPATH}") # Default
 FLUSH_INTERVAL = 5      # seconds
 BUFFER_THRESHOLD = 500  # flush when this many rows accumulate
-SYMBOL = 'ETH/USD'
-SUBPATH = 'ETH-USD'
-OUT = pathlib.Path(f"data/{SUBPATH}"); OUT.mkdir(exist_ok=True)
-EXCHANGES = ['kraken', 'coinbase', 'binanceus', 'gemini', 'mexc', 'hyperliquid']
+
 
 # Parquet schema definition
 tableschema = pa.schema([
@@ -203,12 +202,24 @@ async def main(quiet: bool):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Collect BBO data for a given crypto pair.")
+    parser.add_argument("--coin", type=str, required=True, help="The coin symbol (e.g., BTC)")
+    parser.add_argument("--base", type=str, required=True, help="The base currency symbol (e.g., USDC)")
     parser.add_argument("--minutes", type=float, default=0,
                         help="run for N minutes then exit")
     parser.add_argument("--quiet", action="store_true",
                         help="suppress live prints")
     args = parser.parse_args()
+
+    # --- Update module-level variables based on args ---
+    SYMBOL = f"{args.coin}/{args.base}"
+    SUBPATH = f"{args.coin}-{args.base}"
+    OUT = pathlib.Path(f"data/{SUBPATH}")
+    OUT.mkdir(parents=True, exist_ok=True) # Create directory after defining OUT
+    # -------------------------------------------
+
+    print(f"Collector started for {SYMBOL}...")
+    print(f"Output directory: {OUT}")
 
     if args.minutes > 0:
         try:

@@ -13,13 +13,13 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 import datetime
 import time
+from control import SYMBOL_MAP, EXCHANGES
 
+# ─────────── Globals (potentially redefined by args) ───────────
+SYMBOL    = 'BTC/USDC' # Default
+SUBPATH = 'BTC-USDC'   # Default
+DATA_DIR = Path(f'data/{SUBPATH}') # Default
 
-# ─────────── configuration ───────────
-SYMBOL    = 'BTC/USD'
-SUBPATH = 'BTC-USD'
-DATA_DIR = Path(f'data/{SUBPATH}')
-EXCHANGES = ['binanceus', 'coinbase', 'hyperliquid', 'kraken', 'mexc']
 
 # Maker fees per exchange (decimal fraction)
 FEES = {
@@ -45,7 +45,7 @@ def trade_decision(state):
     """
     best = None
     best_pnl = 0 # min EV hurdle
-    volume_scale = .5 # take a fraction of the min volume to minimize slippage
+    volume_scale = 1 # take a fraction of the min volume to minimize slippage
 
     for buy_ex in EXCHANGES:
         a = state[buy_ex]['ask']
@@ -101,7 +101,7 @@ def load_historical_events():
             df['ts'] = pd.to_datetime(df['ts_ns'], unit='ns')
             df = df.sort_values('ts')
             # only keep rows where bid and ask price changed
-            df = df.loc[(df['bid'] != df['bid'].shift()) & (df['ask'] != df['ask'].shift())]
+            df = df.loc[(df['bid'] != df['bid'].shift()) | (df['ask'] != df['ask'].shift())]
             if df.empty:
                 continue
             df['venue'] = ex
@@ -158,7 +158,17 @@ def run_backtest(event_stream):
 def main():
     print("Building historical events…")
     events = load_historical_events()
+    if not events:
+        print("No events loaded, cannot run backtest.")
+        return
     print(f"Total events: {len(events)}")
+
+    # Calculate duration
+    first_ts = events[0]['ts']
+    last_ts = events[-1]['ts']
+    duration = last_ts - first_ts
+    duration_minutes = duration.total_seconds() / 60
+    print(f"Data duration: {duration} (≈ {duration_minutes:.2f} minutes)")
 
     print("Running backtest…")
     trades = run_backtest(events)
@@ -167,6 +177,13 @@ def main():
     if not trades.empty:
         total = trades['pnl'].sum()
         print(f"Total PnL: {total:.6f}")
+
+        if duration_minutes > 0:
+            profit_per_day = (total / duration_minutes) * 60 * 24
+            print(f"Average Profit per Day: {profit_per_day:.6f}")
+        else:
+            print("Cannot calculate profit per minute (duration is zero or negative).")
+
         plt.figure(figsize=(10,6))
         plt.plot(trades.index, trades['cum_pnl'], label='Cumulative PnL')
         plt.xlabel('Time')
@@ -179,4 +196,18 @@ def main():
         print("No profitable trades.")
 
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="Run arbitrage backtest on collected data.")
+    parser.add_argument("--coin", type=str, required=True, help="The coin symbol (e.g., BTC)")
+    parser.add_argument("--base", type=str, required=True, help="The base currency symbol (e.g., USDC)")
+    args = parser.parse_args()
+
+    # --- Update module-level variables based on args ---
+    SYMBOL = f"{args.coin}/{args.base}"
+    SUBPATH = f"{args.coin}-{args.base}"
+    DATA_DIR = Path(f"data/{SUBPATH}")
+    # -------------------------------------------
+
+    print(f"Starting backtest for {SYMBOL}...")
+    print(f"Data directory: {DATA_DIR}")
+
     main()
