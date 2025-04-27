@@ -52,7 +52,7 @@ def get_current_utc_nanoseconds():
     return int(time.time_ns())
 
 def parquet_path(venue: str) -> pathlib.Path:
-    return OUT / f"{venue}_{datetime.date.today()}.parquet"
+    return OUT / f"{venue}_{SAVE_SYMBOL}.parquet"
 
 
 def append_to_parquet(df: pd.DataFrame, venue: str) -> None:
@@ -205,15 +205,15 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Collect BBO data for a given crypto pair.")
     parser.add_argument("--coin", type=str, required=True, help="The coin symbol (e.g., BTC)")
     parser.add_argument("--base", type=str, required=True, help="The base currency symbol (e.g., USDC)")
-    parser.add_argument("--minutes", type=float, default=0,
-                        help="run for N minutes then exit")
+    parser.add_argument("--path", type=str, required=True, help="The subpath for the output directory")
     parser.add_argument("--quiet", action="store_true",
                         help="suppress live prints")
     args = parser.parse_args()
 
     # --- Update module-level variables based on args ---
     SYMBOL = f"{args.coin}/{args.base}"
-    SUBPATH = f"{args.coin}-{args.base}"
+    SAVE_SYMBOL = f"{args.coin}{args.base}"
+    SUBPATH = args.path
     OUT = pathlib.Path(f"data/{SUBPATH}")
     OUT.mkdir(parents=True, exist_ok=True) # Create directory after defining OUT
     # -------------------------------------------
@@ -221,15 +221,8 @@ if __name__ == '__main__':
     print(f"Collector started for {SYMBOL}...")
     print(f"Output directory: {OUT}")
 
-    if args.minutes > 0:
-        try:
-            asyncio.run(asyncio.wait_for(main(args.quiet), timeout=args.minutes * 60))
-        except asyncio.TimeoutError:
-            pass
-        except KeyboardInterrupt:
-            print("Script interrupted by user")
-    else:
-        try:
-            asyncio.run(main(args.quiet))
-        except KeyboardInterrupt:
-            print("Script interrupted by user")
+
+    try:
+        asyncio.run(main(args.quiet))
+    except KeyboardInterrupt:
+        print("Script interrupted by user")

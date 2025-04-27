@@ -2,212 +2,215 @@
 """
 backtest_with_sizes.py – Decoupled arbitrage backtester with book-impact simulation
 
-Adds bid/ask size to the trading decision and simulates the removal of top-of-book size
-when a trade executes, setting price to None once filled. Additionally, only emits
-new events when the bid or ask price changes for each venue.
+Supports multiple trading pairs in the MarketState and pluggable trade strategies.
 """
 import argparse
 import pandas as pd
 import glob
 import matplotlib.pyplot as plt
 from pathlib import Path
-import datetime
-import time
-from control import SYMBOL_MAP, EXCHANGES
-
-# ─────────── Globals (potentially redefined by args) ───────────
-SYMBOL    = 'BTC/USDC' # Default
-SUBPATH = 'BTC-USDC'   # Default
-DATA_DIR = Path(f'data/{SUBPATH}') # Default
+from control import EXCHANGES
+from strategies import cross_exchange_arbitrage, triangle_arbitrage, MarketState, Trade
+from typing import Callable, Optional, List, Dict
 
 
-# Maker fees per exchange (decimal fraction)
-FEES = {
-    'binanceus':   0.00, #https://www.binance.us/fees
-    'coinbase':    0.0035, #https://www.coinbase.com/advanced-fees
-    'hyperliquid': 0.00035, #https://hyperliquid.gitbook.io/hyperliquid-docs/trading/fees
-    'kraken':      0.002, #https://www.kraken.com/features/fee-schedule
-    'mexc':        0.00, #https://www.mexc.com/zero-fee
-}
-# FEES = {
-#     'binanceus':   0.00, 
-#     'coinbase':    0.00, 
-#     'hyperliquid': 0.000, 
-#     'kraken':      0.0, 
-#     'mexc':        0.00, 
-# }
-
-# ─────────── trading logic ───────────
-def trade_decision(state):
-    """
-    Given the latest bids/asks in `state` dict (including sizes), find the arbitrage
-    trade with max positive PnL after fees and limited by available size.
-    """
-    best = None
-    best_pnl = 0 # min EV hurdle
-    volume_scale = 1 # take a fraction of the min volume to minimize slippage
-
-    for buy_ex in EXCHANGES:
-        a = state[buy_ex]['ask']
-        ask_size = state[buy_ex]['ask_size']
-        if a is None or ask_size is None or ask_size <= 0:
+def load_historical_events(data_dir: Path) -> List[dict]:
+    events: List[dict] = []
+    # Load all parquet files in directory
+    for path in glob.glob(f"{data_dir}/*.parquet"):
+       
+        df = pd.read_parquet(path)
+        # Keep required columns (using 'pair' as the trading pair key)
+        df = df[['ts_ns', 'venue', 'pair', 'bid', 'ask', 'bid_size', 'ask_size']].copy() 
+        # Convert timestamp and sort
+        df['ts'] = pd.to_datetime(df['ts_ns'], unit='ns')
+        df = df.sort_values('ts')
+        # Filter to only price/size changes per venue+pair
+        df['prev_bid'] = df.groupby(['venue', 'pair'])['bid'].shift()
+        df['prev_ask'] = df.groupby(['venue', 'pair'])['ask'].shift()
+        df = df.loc[(df['bid'] != df['prev_bid']) | (df['ask'] != df['prev_ask'])]
+        if df.empty:
             continue
-
-        for sell_ex in EXCHANGES:
-            if sell_ex == buy_ex:
-                continue
-
-            b = state[sell_ex]['bid']
-            bid_size = state[sell_ex]['bid_size']
-            if b is None or bid_size is None or bid_size <= 0:
-                continue
-
-            volume = min(ask_size, bid_size) * volume_scale
-            if volume <= 0:
-                continue
-
-            mid_price = (a + b) / 2
-            fee_amount = (FEES[buy_ex] + FEES[sell_ex]) * mid_price * volume
-            pnl = (b - a) * volume - fee_amount
-
-            if pnl > best_pnl:
-                best_pnl = pnl
-                best = {
-                    'buy_on':    buy_ex,
-                    'sell_on':   sell_ex,
-                    'ask_price': a,
-                    'bid_price': b,
-                    'ask_size':  ask_size,
-                    'bid_size':  bid_size,
-                    'volume':    volume,
-                    'fee':       fee_amount,
-                    'pnl':       pnl,
-                }
-
-    return best
-
-# ─────────── build historical event stream ───────────
-def load_historical_events():
-    events = []
-    for ex in EXCHANGES:
-        pattern = f"{DATA_DIR}/{ex}_*.parquet"
-        for path in glob.glob(pattern):
-            df = pd.read_parquet(path)
-            df = df[df['pair'] == SYMBOL]
-            if df.empty:
-                continue
-            # convert timestamps and sort
-            df = df.copy()
-            df['ts'] = pd.to_datetime(df['ts_ns'], unit='ns')
-            df = df.sort_values('ts')
-            # only keep rows where bid and ask price changed
-            df = df.loc[(df['bid'] != df['bid'].shift()) | (df['ask'] != df['ask'].shift())]
-            if df.empty:
-                continue
-            df['venue'] = ex
-            events.append(df[['ts', 'venue', 'bid', 'ask', 'bid_size', 'ask_size']])
-
+        # Append each row as an event dict
+        for _, row in df.iterrows():
+            events.append({
+                'ts': row['ts'],
+                'venue': row['venue'],
+                'pair': row['pair'],
+                'bid': row['bid'],
+                'ask': row['ask'],
+                'bid_size': row['bid_size'],
+                'ask_size': row['ask_size'],
+            })
     if not events:
-        raise ValueError(f"No events for {SYMBOL}")
+        raise ValueError(f"No events found in {data_dir}")
+    # Sort events chronologically
+    return sorted(events, key=lambda x: x['ts'])
 
-    all_ev = pd.concat(events, ignore_index=True)
-    return all_ev.sort_values('ts').to_dict('records')
 
-# ─────────── backtest runner ───────────
-def run_backtest(event_stream):
-    # initialize orderbook state
-    state = {ex: {'bid': None, 'ask': None, 'bid_size': None, 'ask_size': None} for ex in EXCHANGES}
-    records = []
+def parse_pair(pair_str: str) -> tuple[str, str]:
+    """Parses a pair string like 'BTC/USD' into base and quote."""
+    try:
+        base, quote = pair_str.split('/')
+        return base.strip(), quote.strip()
+    except ValueError:
+        raise ValueError(f"Invalid pair format: {pair_str}. Expected format like 'BASE/QUOTE'.")
+
+
+def run_backtest(
+    event_stream: List[dict],
+    trade_strategy: Callable[[MarketState], List[Trade]]
+) -> pd.DataFrame:
+    # Initialize empty MarketState and Positions (by Coin)
+    state: MarketState = {ex: {} for ex in EXCHANGES}
+    # {venue: {coin: balance}}
+    positions: Dict[str, Dict[str, float]] = {ex: {} for ex in EXCHANGES}
+    records: List[Trade] = []
+
+    # Assume starting with 0 balance for all coins involved
+    # (Balances will be created lazily when first encountered)
 
     for ev in event_stream:
         ts = ev['ts']
         ex = ev['venue']
-        # update book
-        state[ex]['bid'] = ev['bid']
-        state[ex]['ask'] = ev['ask']
-        state[ex]['bid_size'] = ev['bid_size']
-        state[ex]['ask_size'] = ev['ask_size']
+        pair = ev['pair']
+        # Initialize ticker dict if missing
+        if pair not in state[ex]:
+            state[ex][pair] = {'bid': None, 'ask': None, 'bid_size': None, 'ask_size': None}
+        # Update book state
+        ticker = state[ex][pair]
+        ticker['bid'] = ev['bid']
+        ticker['ask'] = ev['ask']
+        ticker['bid_size'] = ev['bid_size']
+        ticker['ask_size'] = ev['ask_size']
 
-        # decide trade
-        trade = trade_decision(state)
-        if trade:
-            trade['timestamp'] = ts
-            records.append(trade)
+        # Invoke strategy on full MarketState
+        potential_trades: List[Trade] = trade_strategy(state)
 
-            # Print trade details
-            print(f"Trade at {ts}: Buy {trade['volume']:.4f} {SYMBOL} on {trade['buy_on']} @ {trade['ask_price']}, "
-                  f"Sell on {trade['sell_on']} @ {trade['bid_price']}. "
-                  f"Fee: {trade['fee']:.6f}, PnL: {trade['pnl']:.6f}")
+        # Process each trade leg returned by the strategy
+        if potential_trades:
+            print("---"*5)
+            for trade in potential_trades:
+                # Stamp executed time as float seconds
+                trade['timestamp'] = ts.timestamp()
+                records.append(trade)
 
-            # simulate top-of-book fill: assumes after a trade executed, the opportunity disappears regardless of how much we filled
-            buy = trade['buy_on']
-            sell = trade['sell_on']
+                # --- Update Positions by Coin ---
+                venue = trade['venue']
+                pair = trade['pair']
+                volume = trade['volume']
+                price = trade['price']
+                side = trade['side']
+                
+                try:
+                    base_coin, quote_coin = parse_pair(pair)
+                except ValueError as e:
+                    print(f"Skipping position update due to error: {e}")
+                    continue # Skip this trade for position tracking
 
-            state[buy]['ask_size'] = None
-            state[buy]['ask'] = None
-            state[sell]['bid_size'] = None
-            state[sell]['bid'] = None
+                # Ensure venue exists in positions (should always be true)
+                if venue not in positions:
+                     positions[venue] = {}
+                     
+                # Get current balances (default to 0 if coin not seen before)
+                base_balance = positions[venue].get(base_coin, 0.0)
+                quote_balance = positions[venue].get(quote_coin, 0.0)
+                
+                cost_or_proceeds = volume * price
 
-    trades = pd.DataFrame(records)
-    if not trades.empty:
-        trades = trades.set_index('timestamp')
-        trades['cum_pnl'] = trades['pnl'].cumsum()
-    return trades
+                if side == 'buy': # Buying base coin, selling quote coin
+                    positions[venue][base_coin] = base_balance + volume
+                    positions[venue][quote_coin] = quote_balance - cost_or_proceeds
+                elif side == 'sell': # Selling base coin, buying quote coin
+                    positions[venue][base_coin] = base_balance - volume
+                    positions[venue][quote_coin] = quote_balance + cost_or_proceeds
+                # --- End Position Update ---
 
-# ─────────── main ───────────
+                # Print trade details
+                print(
+                    f"Trade at {ts}: {side.upper()} {volume:.4f} {pair} on {venue} @ {price:.4f}. "
+                    f"Fee: {trade['fee']:.6f}"
+                )
+
+                # Simulate top-of-book removal based on trade leg
+                traded_pair = trade['pair']
+                trade_venue = trade['venue']
+                if traded_pair in state[trade_venue]:
+                    if trade['side'] == 'buy':
+                        state[trade_venue][traded_pair]['ask'] = None
+                        state[trade_venue][traded_pair]['ask_size'] = None
+                    elif trade['side'] == 'sell':
+                        state[trade_venue][traded_pair]['bid'] = None
+                        state[trade_venue][traded_pair]['bid_size'] = None
+
+    # Print final positions (balances per coin)
+    print("\nFinal Positions (Coin Balances):")
+    has_positions = False
+    for venue, coins in positions.items():
+        venue_has_positions = False
+        for coin, balance in coins.items():
+             if balance != 0:
+                 if not venue_has_positions:
+                     print(f"  {venue}:")
+                     venue_has_positions = True
+                     has_positions = True
+                 print(f"    {coin}: {balance:.8f}") # Increased precision for balances
+    if not has_positions:
+        print("  (No non-zero balances)")
+
+    # Compile trade records into DataFrame (no PnL calculation here)
+    trades_df = pd.DataFrame(records)
+    if not trades_df.empty:
+        trades_df = trades_df.set_index('timestamp')
+
+    return trades_df
+
+
 def main():
-    print("Building historical events…")
-    events = load_historical_events()
-    if not events:
-        print("No events loaded, cannot run backtest.")
-        return
-    print(f"Total events: {len(events)}")
-
-    # Calculate duration
-    first_ts = events[0]['ts']
-    last_ts = events[-1]['ts']
-    duration = last_ts - first_ts
-    duration_minutes = duration.total_seconds() / 60
-    print(f"Data duration: {duration} (≈ {duration_minutes:.2f} minutes)")
-
-    print("Running backtest…")
-    trades = run_backtest(events)
-    print(f"Trades executed: {len(trades)}")
-
-    if not trades.empty:
-        total = trades['pnl'].sum()
-        print(f"Total PnL: {total:.6f}")
-
-        if duration_minutes > 0:
-            profit_per_day = (total / duration_minutes) * 60 * 24
-            print(f"Average Profit per Day: {profit_per_day:.6f}")
-        else:
-            print("Cannot calculate profit per minute (duration is zero or negative).")
-
-        plt.figure(figsize=(10,6))
-        plt.plot(trades.index, trades['cum_pnl'], label='Cumulative PnL')
-        plt.xlabel('Time')
-        plt.ylabel('P&L')
-        plt.title(f'Arbitrage PnL for {SYMBOL}')
-        plt.legend()
-        plt.tight_layout()
-        plt.show()
-    else:
-        print("No profitable trades.")
-
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Run arbitrage backtest on collected data.")
-    parser.add_argument("--coin", type=str, required=True, help="The coin symbol (e.g., BTC)")
-    parser.add_argument("--base", type=str, required=True, help="The base currency symbol (e.g., USDC)")
+    parser = argparse.ArgumentParser(
+        description="Run multi-pair arbitrage backtest on collected data."
+    )
+    parser.add_argument(
+        "--path", type=str, required=True,
+        help="Path to directory containing parquet files with order book snapshots"
+    )
+    parser.add_argument(
+        "--strategy", choices=['cross', 'tri'], default='cross',
+        help="Choose trading strategy: 'cross' for cross-exchange, 'tri' for triangular"
+    )
     args = parser.parse_args()
 
-    # --- Update module-level variables based on args ---
-    SYMBOL = f"{args.coin}/{args.base}"
-    SUBPATH = f"{args.coin}-{args.base}"
-    DATA_DIR = Path(f"data/{SUBPATH}")
-    # -------------------------------------------
+    data_dir = Path(f"data/{args.path}")
+    print(f"Loading events from {data_dir}...")
+    try:
+        events = load_historical_events(data_dir)
+    except ValueError as e:
+        print(f"Error loading events: {e}")
+        return
+    except FileNotFoundError:
+        print(f"Error: Data directory not found at {data_dir}")
+        return
 
-    print(f"Starting backtest for {SYMBOL}...")
-    print(f"Data directory: {DATA_DIR}")
+    print(f"Total events loaded: {len(events)}")
 
+    # Select strategy function
+    strategy_fn = (
+        cross_exchange_arbitrage if args.strategy == 'cross'
+        else triangle_arbitrage
+    )
+
+    print("\nRunning backtest…")
+    trades = run_backtest(events, strategy_fn)
+    print(f"\nTotal trade legs executed: {len(trades)}")
+
+    # PnL reporting and plotting removed
+    if not trades.empty:
+        # Optional: Save trades log to csv
+        # trades.to_csv('backtest_trades.csv')
+        # print("Trade log saved to backtest_trades.csv")
+        pass # No PnL to report here
+    else:
+        print("No trades executed.")
+
+if __name__ == '__main__':
     main()
