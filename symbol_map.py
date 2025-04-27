@@ -2,7 +2,7 @@ import ccxt.pro as ccxt
 import asyncio
 
 async def main():
-    exchange_id = 'gemini'
+    exchange_id = 'mexc'
     cls = getattr(ccxt, exchange_id)
     exchange = cls({ 'enableRateLimit': True })
     try:
@@ -17,19 +17,21 @@ async def main():
 SYMBOL_MAP = {
     'BTC/USD' : {
         'kraken' : 'BTC/USD',
-        'hyperliquid' : 'BTC/USDC:USDC',
+        'hyperliquid' : 'BTC',
         'gemini' : 'BTC/GUSD',
         'coinbase' : 'BTC/USD',
         'binanceus' : 'BTC/USD',
-        'bitfinex' : 'BTC/USD'
+        'bitfinex' : 'BTC/USD',
+        'mexc' : 'BTC/USDC'
     },
     'ETH/USD' : {
         'kraken' : 'ETH/USD',
-        'hyperliquid' : 'ETH/USDC:USDC',
+        'hyperliquid' : 'ETH',
         'gemini' : 'ETH/GUSD',
         'coinbase' : 'ETH/USD',
         'binanceus' : 'ETH/USD',
-        'bitfinex' : 'ETH/USD'
+        'bitfinex' : 'ETH/USD',
+        'mexc' : 'ETH/USDC'
     }
 }
 

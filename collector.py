@@ -3,16 +3,16 @@
 """
 collector.py – ETH/USDC best-bid/ask printer + Parquet logger using ccxt.pro
 
-Streams and prints every top-of-book update for ETH/USDC from:
+Streams and prints every top-of-book update for BTC/USD from:
   • Kraken
   • Coinbase Advanced Trade
   • Binance US
   • Gemini
   • Bitfinex
-  • Hyperliquid (append :USDC suffix)
+  • Hyperliquid
 
 Uses ccxt.pro for unified websocket interfaces. Stores rows to per-venue daily Parquet files.
-Each row schema: ts_ns | pair | bid | ask | venue
+Each row schema: ts_ns | pair | bid | ask | bid_size | ask_size | venue
 """
 import asyncio
 import signal
@@ -25,22 +25,32 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import ccxt.pro as ccxt
 from symbol_map import SYMBOL_MAP
+import websockets
+import json
+import time
+
 # ─────────── configuration ───────────
-OUT = pathlib.Path("data"); OUT.mkdir(exist_ok=True)
 FLUSH_INTERVAL = 5      # seconds
 BUFFER_THRESHOLD = 500  # flush when this many rows accumulate
-SYMBOL = 'BTC/USD'
-EXCHANGES = ['kraken', 'coinbase', 'hyperliquid', 'binanceus', 'gemini']
+SYMBOL = 'ETH/USD'
+SUBPATH = 'ETH-USD'
+OUT = pathlib.Path(f"data/{SUBPATH}"); OUT.mkdir(exist_ok=True)
+EXCHANGES = ['kraken', 'coinbase', 'binanceus', 'gemini', 'mexc', 'hyperliquid']
 
 # Parquet schema definition
 tableschema = pa.schema([
-    ("ts_ns", pa.int64()),
-    ("pair" , pa.string()),
-    ("bid"  , pa.float64()),
-    ("ask"  , pa.float64()),
-    ("venue", pa.string()),
+    ("ts_ns",    pa.int64()),
+    ("pair",     pa.string()),
+    ("bid",      pa.float64()),
+    ("ask",      pa.float64()),
+    ("bid_size", pa.float64()),
+    ("ask_size", pa.float64()),
+    ("venue",    pa.string()),
 ])
 
+def get_current_utc_nanoseconds():
+    """Returns the current UTC time as nanoseconds since the epoch."""
+    return int(time.time_ns())
 
 def parquet_path(venue: str) -> pathlib.Path:
     return OUT / f"{venue}_{datetime.date.today()}.parquet"
@@ -60,8 +70,8 @@ class Buffer:
         self.rows: list = []
         self.lock = asyncio.Lock()
 
-    def add(self, ts_ns: int, pair: str, bid: float, ask: float):
-        self.rows.append((ts_ns, pair, bid, ask, self.venue))
+    def add(self, ts_ns: int, pair: str, bid: float, ask: float, bid_size: float, ask_size: float):
+        self.rows.append((ts_ns, pair, bid, ask, bid_size, ask_size, self.venue))
 
     async def flush(self) -> None:
         async with self.lock:
@@ -73,30 +83,87 @@ class Buffer:
 
 
 async def watch_exchange(exchange_id: str, queue: asyncio.Queue):
-    cls = getattr(ccxt, exchange_id)
-    exchange = cls({ 'enableRateLimit': True })
     try:
-        await exchange.load_markets()
-        market = SYMBOL_MAP[SYMBOL][exchange_id]
-        # stream
-        while True:
-            try:
-                ticker = await exchange.watch_ticker(market)
-            except Exception:
-                await asyncio.sleep(1)
-                continue
-            bid = ticker.get('bid')
-            ask = ticker.get('ask')
-            if bid is None or ask is None:
-                continue
-            ts_ns = int(exchange.milliseconds() * 1_000_000)
-            await queue.put((exchange_id, SYMBOL, bid, ask, ts_ns))
+        if exchange_id == "hyperliquid":
+            await watch_hyperliquid(queue)
+            return
+        else:
+            cls = getattr(ccxt, exchange_id)
+            exchange = cls({ 'enableRateLimit': True })
+            
+            await exchange.load_markets()
+            market = SYMBOL_MAP[SYMBOL][exchange_id]
+            while True:
+                try:
+                    ticker = await exchange.watch_ticker(market)
+                except Exception:
+                    await asyncio.sleep(1)
+                    continue
+                bid      = ticker.get('bid')
+                ask      = ticker.get('ask')
+                bid_size = ticker.get('bidVolume')
+                ask_size = ticker.get('askVolume')
+                if bid is None or ask is None:
+                    continue
+                
+                await queue.put((exchange_id, SYMBOL, bid, ask, bid_size, ask_size, get_current_utc_nanoseconds()))
     except asyncio.CancelledError:
         pass
     except Exception as e:
         print(f"Error on {exchange_id}: {e}")
     finally:
         await exchange.close()
+
+async def watch_hyperliquid(queue: asyncio.Queue):
+    """
+    Connects to Hyperliquid's WebSocket and streams BBO for `coin`.
+    On every update it does:
+        await queue.put((exchange, symbol, bid, ask, bid_size, ask_size, timestamp_ns))
+    """
+    uri = "wss://api.hyperliquid.xyz/ws"
+    exchange_id = "hyperliquid"
+    coin = SYMBOL_MAP[SYMBOL][exchange_id]
+    async with websockets.connect(uri) as ws:
+        # 1) subscribe to the BBO feed
+        await ws.send(json.dumps({
+            "method": "subscribe",
+            "subscription": {
+                "type": "bbo",
+                "coin": coin
+            }
+        }))
+
+        # 2) consume updates
+        async for raw in ws:
+            msg = json.loads(raw)
+
+            # Hyperliquid labels feeds with a "channel" field
+            if msg.get("channel") != "bbo":
+                continue
+
+            data = msg["data"]
+            bid_level, ask_level = data.get("bbo", [None, None])
+
+            # skip if either side is missing
+            if not bid_level or not ask_level:
+                continue
+
+            # parse out floats
+            bid      = float(bid_level["px"])
+            ask      = float(ask_level["px"])
+            bid_size = float(bid_level["sz"])
+            ask_size = float(ask_level["sz"])
+            ts_ns    = get_current_utc_nanoseconds()
+
+            await queue.put((
+                "hyperliquid",
+                SYMBOL,
+                bid,
+                ask,
+                bid_size,
+                ask_size,
+                ts_ns
+            ))
 
 
 async def flusher(buffers: dict):
@@ -120,13 +187,13 @@ async def main(quiet: bool):
 
     try:
         while True:
-            venue, pair, bid, ask, ts_ns = await queue.get()
+            venue, pair, bid, ask, bid_size, ask_size, ts_ns = await queue.get()
             buf = buffers.get(venue)
             if buf:
-                buf.add(ts_ns, pair, bid, ask)
+                buf.add(ts_ns, pair, bid, ask, bid_size, ask_size)
                 if not quiet:
                     now = datetime.datetime.utcnow().strftime("%H:%M:%S.%f")[:-3]
-                    print(f"{now}  {venue:<12} {bid:.8f} / {ask:.8f}")
+                    print(f"{now}  {venue:<12} {bid:.8f} / {ask:.8f}   size {bid_size}/{ask_size}")
                 if len(buf.rows) >= BUFFER_THRESHOLD:
                     await buf.flush()
     except asyncio.CancelledError:
@@ -148,5 +215,10 @@ if __name__ == '__main__':
             asyncio.run(asyncio.wait_for(main(args.quiet), timeout=args.minutes * 60))
         except asyncio.TimeoutError:
             pass
+        except KeyboardInterrupt:
+            print("Script interrupted by user")
     else:
-        asyncio.run(main(args.quiet))
+        try:
+            asyncio.run(main(args.quiet))
+        except KeyboardInterrupt:
+            print("Script interrupted by user")
