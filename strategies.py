@@ -2,91 +2,127 @@ from typing import Dict, Optional, TypedDict, List
 from control import FEES, SYMBOL_MAP
 from backtest import State, Trade
 
+
 def cash_and_carry(state: State) -> List[Trade]:
     """
-    Cash-and-carry strategy: buy spot on the cheapest venue and short perp on Hyperliquid
-    when the perp basis exceeds fees. Avoid re-entry if a perp position is already open.
+    Cash-and-carry strategy on Hyperliquid perp vs. spot on other venues.
+    - If perp_bid > spot_ask: buy spot / sell perp
+    - If perp_ask < spot_bid: sell spot / buy perp
+    Earns positive basis and captures funding (funding_rate can be read from the perp Ticker).
     """
-    books = state.tickers
+    print(state)
+    print("--------------------------------")
+    
+    books     = state.tickers
     positions = state.positions
     trades: List[Trade] = []
+
     spot_pair = 'BTC/USDC'
-    hyper = 'hyperliquid-perp'
+    hyper     = 'hyperliquid-perp'
+    perp_pair = SYMBOL_MAP['BTC'][hyper]
 
-    perp_pair = SYMBOL_MAP['BTC'][hyper]  # Get Hyperliquid symbol from SYMBOL_MAP
-
-    print(state)
-
-    # do not re-enter if a perp short is already on
-    if positions.get(hyper, {}).get(perp_pair, 0) != 0:
+    # avoid re-entry if we already have ANY open perp position
+    open_perp = positions.get(hyper, {}).get(perp_pair, 0)
+    if open_perp != 0:
         return trades
 
-    # find cheapest spot ask
-    best_ask = float('inf')
-    best_venue = None
-    best_ask_sz = 0.0
+    # --- find best spot ask and best spot bid across venues ---
+    best_ask = float('inf'); ask_venue = None;  ask_sz = 0.0
+    best_bid = -float('inf'); bid_venue = None; bid_sz = 0.0
+
     for venue, pairs in books.items():
         if venue == hyper:
             continue
-        tick = pairs.get(spot_pair)
-        if not tick:
+        t = pairs.get(spot_pair)
+        if not t:
             continue
-        ask = tick.get('ask'); ask_sz = tick.get('ask_size')
-        if ask is None or ask_sz is None or ask_sz <= 0:
-            continue
-        if ask < best_ask:
-            best_ask = ask
-            best_ask_sz = ask_sz
-            best_venue = venue
+        a, asz = t.get('ask'), t.get('ask_size')
+        b, bsz = t.get('bid'), t.get('bid_size')
+        if a and asz and asz>0 and a<best_ask:
+            best_ask, ask_venue, ask_sz = a, venue, asz
+        if b and bsz and bsz>0 and b>best_bid:
+            best_bid, bid_venue, bid_sz = b, venue, bsz
 
-    if best_venue is None:
+    # no valid spot quotes?
+    if ask_venue is None or bid_venue is None:
         return trades
 
-    # get perp bid
-    hyper_books = books.get(hyper, {})
-    perp_tick = hyper_books.get(perp_pair)
-    if not perp_tick:
+    # --- perp top‐of‐book + funding_rate ---
+    perp_t = books.get(hyper, {}).get(perp_pair)
+    if not perp_t:
         return trades
-    perp_bid = perp_tick.get('bid'); perp_bid_sz = perp_tick.get('bid_size')
-    if perp_bid is None or perp_bid_sz is None or perp_bid_sz <= 0:
-        return trades
+    perp_bid    = perp_t.get('bid');    perp_bid_sz = perp_t.get('bid_size')
+    perp_ask    = perp_t.get('ask');    perp_ask_sz = perp_t.get('ask_size')
+    funding_pct = perp_t.get('funding_rate') or 0.0
 
-    # compute volume
-    volume = min(best_ask_sz, perp_bid_sz)
-    if volume <= 0:
-        return trades
+    # Entry #1: perp > spot (buy spot, sell perp)
+    if perp_bid and perp_bid_sz and perp_bid > best_ask:
+        vol = min(ask_sz, perp_bid_sz)
+        fee_spot_rate = FEES.get(ask_venue, {}).get(spot_pair, 0.0)
+        fee_perp_rate = FEES.get(hyper, {}).get(perp_pair, 0.0)
+        fee_spot = fee_spot_rate * best_ask * vol
+        fee_perp = fee_perp_rate * perp_bid * vol
+        # include one period of funding income (you're short perp, funding_pct>0 pays shorts)
+        funding_income = funding_pct * perp_bid * vol
+        pnl = (perp_bid - best_ask)*vol - (fee_spot+fee_perp) + funding_income
+        
+        if pnl > 0:
+            trades.append(Trade({
+                'pair':   spot_pair,
+                'venue':  ask_venue,
+                'side':   'buy',
+                'price':  best_ask,
+                'volume': vol,
+                'fee':    fee_spot,
+                'ts_ns':  None,
+                'type':   'spot'
+            }))
+            trades.append(Trade({
+                'pair':   perp_pair,
+                'venue':  hyper,
+                'side':   'sell',
+                'price':  perp_bid,
+                'volume': vol,
+                'fee':    fee_perp,
+                'ts_ns':  None,
+                'type':   'perp'
+            }))
+            return trades
 
-    # compute fees and net PnL
-    fee_spot_rate = FEES.get(best_venue, {}).get(spot_pair, 0.0)
-    fee_perp_rate = FEES.get(hyper, {}).get(perp_pair, 0.0)
-    fee_spot = fee_spot_rate * best_ask * volume
-    fee_perp = fee_perp_rate * perp_bid * volume
-    pnl = (perp_bid - best_ask) * volume - (fee_spot + fee_perp)
+    # Entry #2: perp < spot (sell spot, buy perp)
+    if perp_ask and perp_ask_sz and perp_ask < best_bid:
+        vol = min(bid_sz, perp_ask_sz)
+        fee_spot_rate = FEES.get(bid_venue, {}).get(spot_pair, 0.0)
+        fee_perp_rate = FEES.get(hyper, {}).get(perp_pair, 0.0)
+        fee_spot = fee_spot_rate * best_bid * vol
+        fee_perp = fee_perp_rate * perp_ask * vol
+        # you're long perp, funding_pct>0 → you pay funding_pct; as long, funding_pct>0 means longs pay shorts
+        funding_cost = funding_pct * perp_ask * vol
+        pnl = (best_bid - perp_ask)*vol - (fee_spot+fee_perp) - funding_cost
+        if pnl > 0:
+            trades.append(Trade({
+                'pair':   spot_pair,
+                'venue':  bid_venue,
+                'side':   'sell',
+                'price':  best_bid,
+                'volume': vol,
+                'fee':    fee_spot,
+                'ts_ns':  None,
+                'type':   'spot'
+            }))
+            trades.append(Trade({
+                'pair':   perp_pair,
+                'venue':  hyper,
+                'side':   'buy',
+                'price':  perp_ask,
+                'volume': vol,
+                'fee':    fee_perp,
+                'ts_ns':  None,
+                'type':   'perp'
+            }))
+            return trades
 
-    if pnl <= 0:
-        return trades
-
-    # entry legs
-    trades.append(Trade({
-        'pair':      spot_pair,
-        'venue':     best_venue,
-        'side':      'buy',
-        'price':     best_ask,
-        'volume':    volume,
-        'fee':       fee_spot,
-        'ts_ns': None
-    }))
-    trades.append(Trade({
-        'pair':      perp_pair,
-        'venue':     hyper,
-        'side':      'sell',
-        'price':     perp_bid,
-        'volume':    volume,
-        'fee':       fee_perp,
-        'ts_ns': None
-    }))
     return trades
-
 
 def cross_exchange_arbitrage(state: State) -> List[Trade]:
     """
@@ -147,7 +183,8 @@ def cross_exchange_arbitrage(state: State) -> List[Trade]:
             'price':     best['ask_price'],
             'volume':    best['volume'],
             'fee':       best['buy_fee'],
-            'ts_ns': None
+            'ts_ns': None,
+            'type': 'spot'
         }))
         trades.append(Trade({
             'pair':      best['pair'],
@@ -156,7 +193,8 @@ def cross_exchange_arbitrage(state: State) -> List[Trade]:
             'price':     best['bid_price'],
             'volume':    best['volume'],
             'fee':       best['sell_fee'],
-            'ts_ns': None
+            'ts_ns': None,
+            'type': 'spot'
         }))
     return trades
 
@@ -257,16 +295,16 @@ def triangle_arbitrage(state: State) -> List[Trade]:
         if net_pnl_A > best_pnl and net_pnl_A > net_pnl_B:
             best_pnl = net_pnl_A
             best_trades = [
-                Trade({'pair': p_btc_usdc, 'venue': ex, 'side': 'buy',  'price': ask_btc_usdc, 'volume': final_vol_btc_A, 'fee': fee_btc_usdc*ask_btc_usdc*final_vol_btc_A, 'ts_ns': None}),
-                Trade({'pair': p_eth_btc,  'venue': ex, 'side': 'buy',  'price': ask_eth_btc,  'volume': final_vol_eth_A, 'fee': fee_eth_btc *ask_eth_btc *final_vol_eth_A, 'ts_ns': None}),
-                Trade({'pair': p_eth_usdc, 'venue': ex, 'side': 'sell', 'price': bid_eth_usdc, 'volume': final_vol_eth_A, 'fee': fee_eth_usdc*bid_eth_usdc*final_vol_eth_A, 'ts_ns': None})
+                Trade({'pair': p_btc_usdc, 'venue': ex, 'side': 'buy',  'price': ask_btc_usdc, 'volume': final_vol_btc_A, 'fee': fee_btc_usdc*ask_btc_usdc*final_vol_btc_A, 'ts_ns': None, 'type': 'spot'}),
+                Trade({'pair': p_eth_btc,  'venue': ex, 'side': 'buy',  'price': ask_eth_btc,  'volume': final_vol_eth_A, 'fee': fee_eth_btc *ask_eth_btc *final_vol_eth_A, 'ts_ns': None, 'type': 'spot'}),
+                Trade({'pair': p_eth_usdc, 'venue': ex, 'side': 'sell', 'price': bid_eth_usdc, 'volume': final_vol_eth_A, 'fee': fee_eth_usdc*bid_eth_usdc*final_vol_eth_A, 'ts_ns': None, 'type': 'spot'})
             ]
         elif net_pnl_B > best_pnl:
             best_pnl = net_pnl_B
             best_trades = [
-                Trade({'pair': p_eth_usdc, 'venue': ex, 'side': 'buy',  'price': ask_eth_usdc, 'volume': final_vol_eth_B, 'fee': fee_eth_usdc*ask_eth_usdc*final_vol_eth_B, 'ts_ns': None}),
-                Trade({'pair': p_eth_btc,  'venue': ex, 'side': 'sell', 'price': bid_eth_btc,  'volume': final_vol_eth_B, 'fee': fee_eth_btc *bid_eth_btc *final_vol_eth_B, 'ts_ns': None}),
-                Trade({'pair': p_btc_usdc, 'venue': ex, 'side': 'sell', 'price': bid_btc_usdc, 'volume': final_vol_btc_B, 'fee': fee_btc_usdc*bid_btc_usdc*final_vol_btc_B, 'ts_ns': None})
+                Trade({'pair': p_eth_usdc, 'venue': ex, 'side': 'buy',  'price': ask_eth_usdc, 'volume': final_vol_eth_B, 'fee': fee_eth_usdc*ask_eth_usdc*final_vol_eth_B, 'ts_ns': None, 'type': 'spot'}),
+                Trade({'pair': p_eth_btc,  'venue': ex, 'side': 'sell', 'price': bid_eth_btc,  'volume': final_vol_eth_B, 'fee': fee_eth_btc *bid_eth_btc *final_vol_eth_B, 'ts_ns': None, 'type': 'spot'}),
+                Trade({'pair': p_btc_usdc, 'venue': ex, 'side': 'sell', 'price': bid_btc_usdc, 'volume': final_vol_btc_B, 'fee': fee_btc_usdc*bid_btc_usdc*final_vol_btc_B, 'ts_ns': None, 'type': 'spot'})
             ]
             
     return best_trades

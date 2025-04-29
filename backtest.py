@@ -34,7 +34,8 @@ Trade = TypedDict('Trade', {
     'price':     float,
     'volume':    float,
     'fee':       float,
-    'ts_ns': Optional[float]
+    'ts_ns': Optional[float],
+    'type': str # 'spot' or 'perp'
 })
 
 class State:
@@ -130,7 +131,13 @@ class Backtester:
         price = t["price"]
         vol   = t["volume"]
         fee   = t["fee"]
-        base, quote = pair.split("/")
+        trade_type = t["type"]
+        
+        if trade_type == "spot":
+            base, quote = pair.split("/")
+        else:
+            base = pair
+            quote = "USDC"
 
         # ensure positions entry exists
         bal = self.positions.setdefault(venue, {})
