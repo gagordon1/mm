@@ -7,7 +7,7 @@ SYMBOL_MAP = {
     'BTC/USDC' : {
         'kraken' : 'BTC/USDC',
         'hyperliquid' : '@142', #UBTC/USDC
-        'gemini' : 'BTC/USDC',
+        'gemini' : 'BTC/USD',
         'coinbase' : 'BTC/USDC',
         'binanceus' : 'BTC/USDC',
         'bitfinex' : 'BTC/USDC',
@@ -39,6 +39,9 @@ SYMBOL_MAP = {
         'binanceus' : 'ETH/BTC',
         'bitfinex' : 'ETH/BTC',
         'mexc' : 'ETH/BTC'
+    },
+    'BTC': {
+        'hyperliquid-perp': 'BTC',
     }
 }
 
@@ -76,6 +79,9 @@ FEES = {
         'BTC/USDC': 0.004,
         'ETH/USDC': 0.004,
         'ETH/BTC': 0.004,
+    },
+    'hyperliquid-perp': {
+        'BTC': 0.00035,
     }
 }
 
