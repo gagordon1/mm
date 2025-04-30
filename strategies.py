@@ -3,125 +3,194 @@ from control import FEES, SYMBOL_MAP
 from backtest import State, Trade
 
 
-def cash_and_carry(state: State) -> List[Trade]:
+# Strategy 1: positive basis (perp > spot)
+def cash_and_carry_positive(state: State) -> List[Trade]:
     """
-    Cash-and-carry strategy on Hyperliquid perp vs. spot on other venues.
-    - If perp_bid > spot_ask: buy spot / sell perp
-    - If perp_ask < spot_bid: sell spot / buy perp
-    Earns positive basis and captures funding (funding_rate can be read from the perp Ticker).
+    Enter when perp_bid > spot_ask:
+      • buy spot on cheapest venue
+      • sell perp on Hyperliquid
     """
-    print(state)
-    print("--------------------------------")
-    
-    books     = state.tickers
-    positions = state.positions
+    books = state.tickers
+    pos   = state.positions
     trades: List[Trade] = []
 
     spot_pair = 'BTC/USDC'
     hyper     = 'hyperliquid-perp'
     perp_pair = SYMBOL_MAP['BTC'][hyper]
 
-    # avoid re-entry if we already have ANY open perp position
-    open_perp = positions.get(hyper, {}).get(perp_pair, 0)
-    if open_perp != 0:
+    # avoid re-entry if any perp position exists
+    if pos.get(hyper, {}).get(perp_pair, 0) != 0:
         return trades
 
-    # --- find best spot ask and best spot bid across venues ---
+    # find cheapest spot ask
     best_ask = float('inf'); ask_venue = None;  ask_sz = 0.0
-    best_bid = -float('inf'); bid_venue = None; bid_sz = 0.0
-
     for venue, pairs in books.items():
-        if venue == hyper:
-            continue
+        if venue == hyper: continue
         t = pairs.get(spot_pair)
+        if not t: continue
+        a, sz = t.get('ask'), t.get('ask_size')
+        if a is None or sz is None or sz <= 0: continue
+        if a < best_ask:
+            best_ask, ask_venue, ask_sz = a, venue, sz
+    if ask_venue is None:
+        return trades
+
+    # perp bid
+    pt = books.get(hyper, {}).get(perp_pair)
+    if not pt: return trades
+    pb, pbsz = pt.get('bid'), pt.get('bid_size')
+    if pb is None or pbsz is None or pbsz <= 0:
+        return trades
+
+    if pb <= best_ask:
+        return trades
+
+    # compute volume and PnL
+    vol = min(ask_sz, pbsz)
+    fee_spot = FEES.get(ask_venue, {}).get(spot_pair, 0.0) * best_ask * vol
+    fee_perp = FEES.get(hyper, {}).get(perp_pair, 0.0) * pb * vol
+    funding  = (pt.get('funding_rate') or 0.0) * pb  * vol  # funding income
+    pnl = (pb - best_ask) * vol - (fee_spot + fee_perp) + funding
+    if pnl <= 0:
+        return trades
+
+    # emit trades
+    trades.append(Trade({
+        'pair':  spot_pair,
+        'venue': ask_venue,
+        'side':  'buy',
+        'price': best_ask,
+        'volume': vol,
+        'fee':    fee_spot,
+        'ts_ns':  None,
+        'type': 'spot'
+    }))
+    trades.append(Trade({
+        'pair':  perp_pair,
+        'venue': hyper,
+        'side':  'sell',
+        'price': pb,
+        'volume': vol,
+        'fee':    fee_perp,
+        'ts_ns':  None,
+        'type': 'perp'
+    }))
+    return trades
+
+
+def cash_and_carry_negative(state: State) -> List[Trade]:
+    """
+    Negative basis cycle:
+      - Open when (spot_bid - perp_ask) >= START (enter):
+          • sell spot / buy perp
+      - Close when (spot_ask - perp_bid) <= END (exit):
+          • buy spot / sell perp on the same venues used at entry
+    """
+    books = state.tickers
+    pos   = state.positions
+    trades: List[Trade] = []
+
+    spot_pair = 'BTC/USDC'
+    hyper     = 'hyperliquid-perp'
+    perp_pair = SYMBOL_MAP['BTC'][hyper]
+    START     = 100
+    END       = 5
+
+    # detect open position: perp long and spot short
+    open_vol = pos.get(hyper, {}).get(perp_pair, 0)
+    short_venues = [v for v, bals in pos.items() if bals.get(perp_pair, 0) < 0]
+
+    if open_vol > 0 and short_venues:
+        # close on same venues
+        spot_venue = short_venues[0]
+        pt = books.get(hyper, {}).get(perp_pair)
+        if not pt:
+            return trades
+        perp_bid = pt.get('bid')
+        t_spot = books.get(spot_venue, {}).get(spot_pair)
+        if perp_bid is None or not t_spot:
+            return trades
+        spot_ask = t_spot.get('ask')
+        if spot_ask is None:
+            return trades
+        exit_spread = spot_ask - perp_bid
+        if exit_spread <= END:
+            vol = min(open_vol, pt.get('bid_size') or 0, t_spot.get('ask_size') or 0)
+            fee_spot = FEES.get(spot_venue, {}).get(spot_pair, 0.0) * spot_ask * vol
+            fee_perp = FEES.get(hyper, {}).get(perp_pair, 0.0) * perp_bid * vol
+            trades.append(Trade({
+                'pair': spot_pair,  'venue': spot_venue, 'side': 'buy',
+                'price': spot_ask,  'volume': vol,        'fee': fee_spot, 'ts_ns': None,
+                'type': 'spot'
+            }))
+            trades.append(Trade({
+                'pair': perp_pair,  'venue': hyper,      'side': 'sell',
+                'price': perp_bid,  'volume': vol,        'fee': fee_perp, 'ts_ns': None,
+                'type': 'perp'
+            }))
+        return trades
+
+    # no open: check entry condition
+    # find best spot bid
+    best_bid = -float('inf')
+    bid_venue = None
+    bid_sz = 0.0
+    for v, pmap in books.items():
+        if v == hyper:
+            continue
+        t = pmap.get(spot_pair)
         if not t:
             continue
-        a, asz = t.get('ask'), t.get('ask_size')
-        b, bsz = t.get('bid'), t.get('bid_size')
-        if a and asz and asz>0 and a<best_ask:
-            best_ask, ask_venue, ask_sz = a, venue, asz
-        if b and bsz and bsz>0 and b>best_bid:
-            best_bid, bid_venue, bid_sz = b, venue, bsz
-
-    # no valid spot quotes?
-    if ask_venue is None or bid_venue is None:
+        b = t.get('bid')
+        sz = t.get('bid_size')
+        if b is None or sz is None or sz <= 0:
+            continue
+        if b > best_bid:
+            best_bid, bid_venue, bid_sz = b, v, sz
+    if bid_venue is None:
         return trades
 
-    # --- perp top‐of‐book + funding_rate ---
-    perp_t = books.get(hyper, {}).get(perp_pair)
-    if not perp_t:
+    pt = books.get(hyper, {}).get(perp_pair)
+    if not pt:
         return trades
-    perp_bid    = perp_t.get('bid');    perp_bid_sz = perp_t.get('bid_size')
-    perp_ask    = perp_t.get('ask');    perp_ask_sz = perp_t.get('ask_size')
-    funding_pct = perp_t.get('funding_rate') or 0.0
+    pa = pt.get('ask')
+    pasz = pt.get('ask_size')
+    if pa is None or pasz is None or pasz <= 0:
+        return trades
 
-    # Entry #1: perp > spot (buy spot, sell perp)
-    if perp_bid and perp_bid_sz and perp_bid > best_ask:
-        vol = min(ask_sz, perp_bid_sz)
-        fee_spot_rate = FEES.get(ask_venue, {}).get(spot_pair, 0.0)
-        fee_perp_rate = FEES.get(hyper, {}).get(perp_pair, 0.0)
-        fee_spot = fee_spot_rate * best_ask * vol
-        fee_perp = fee_perp_rate * perp_bid * vol
-        # include one period of funding income (you're short perp, funding_pct>0 pays shorts)
-        funding_income = funding_pct * perp_bid * vol
-        pnl = (perp_bid - best_ask)*vol - (fee_spot+fee_perp) + funding_income
-        
-        if pnl > 0:
-            trades.append(Trade({
-                'pair':   spot_pair,
-                'venue':  ask_venue,
-                'side':   'buy',
-                'price':  best_ask,
-                'volume': vol,
-                'fee':    fee_spot,
-                'ts_ns':  None,
-                'type':   'spot'
-            }))
-            trades.append(Trade({
-                'pair':   perp_pair,
-                'venue':  hyper,
-                'side':   'sell',
-                'price':  perp_bid,
-                'volume': vol,
-                'fee':    fee_perp,
-                'ts_ns':  None,
-                'type':   'perp'
-            }))
-            return trades
+    entry_spread = best_bid - pa
+    if entry_spread < START:
+        return trades
 
-    # Entry #2: perp < spot (sell spot, buy perp)
-    if perp_ask and perp_ask_sz and perp_ask < best_bid:
-        vol = min(bid_sz, perp_ask_sz)
-        fee_spot_rate = FEES.get(bid_venue, {}).get(spot_pair, 0.0)
-        fee_perp_rate = FEES.get(hyper, {}).get(perp_pair, 0.0)
-        fee_spot = fee_spot_rate * best_bid * vol
-        fee_perp = fee_perp_rate * perp_ask * vol
-        # you're long perp, funding_pct>0 → you pay funding_pct; as long, funding_pct>0 means longs pay shorts
-        funding_cost = funding_pct * perp_ask * vol
-        pnl = (best_bid - perp_ask)*vol - (fee_spot+fee_perp) - funding_cost
-        if pnl > 0:
-            trades.append(Trade({
-                'pair':   spot_pair,
-                'venue':  bid_venue,
-                'side':   'sell',
-                'price':  best_bid,
-                'volume': vol,
-                'fee':    fee_spot,
-                'ts_ns':  None,
-                'type':   'spot'
-            }))
-            trades.append(Trade({
-                'pair':   perp_pair,
-                'venue':  hyper,
-                'side':   'buy',
-                'price':  perp_ask,
-                'volume': vol,
-                'fee':    fee_perp,
-                'ts_ns':  None,
-                'type':   'perp'
-            }))
-            return trades
+    vol = min(bid_sz, pasz)
+    # Entry fees
+    fee_spot = FEES.get(bid_venue, {}).get(spot_pair, 0.0) * best_bid * vol
+    fee_perp = FEES.get(hyper, {}).get(perp_pair, 0.0) * pa * vol
+    
+    # Exit scenario (using END spread)
+    exit_spot_price = best_bid - entry_spread  # approximate exit spot price
+    exit_perp_price = pa + entry_spread        # approximate exit perp price
+    exit_fee_spot = FEES.get(bid_venue, {}).get(spot_pair, 0.0) * exit_spot_price * vol
+    exit_fee_perp = FEES.get(hyper, {}).get(perp_pair, 0.0) * exit_perp_price * vol
+    
+    # Calculate EV: entry PnL + exit PnL
+    entry_pnl = entry_spread * vol - (fee_spot + fee_perp)
+    exit_pnl = -END * vol - (exit_fee_spot + exit_fee_perp)
+    ev = entry_pnl + exit_pnl
+    
+    if ev <= 0:
+        return trades
 
+    trades.append(Trade({
+        'pair': spot_pair,  'venue': bid_venue, 'side': 'sell',
+        'price': best_bid,  'volume': vol,      'fee': fee_spot, 'ts_ns': None,
+        'type': 'spot'
+    }))
+    trades.append(Trade({
+        'pair': perp_pair,  'venue': hyper,      'side': 'buy',
+        'price': pa,        'volume': vol,      'fee': fee_perp, 'ts_ns': None,
+        'type': 'perp'
+    }))
     return trades
 
 def cross_exchange_arbitrage(state: State) -> List[Trade]:

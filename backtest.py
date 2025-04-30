@@ -1,214 +1,181 @@
 #!/usr/bin/env python3
 """
-backtest.py – Backtesting framework with pluggable strategies (using State and Trade types from strategies.py)
+backtest.py – Backtesting framework with pluggable strategies (using State and Trade types)
+Tracks PnL including funding income and fees.
 """
 import argparse
 import importlib
 from pathlib import Path
-from typing import List, Dict, Callable, Optional, TypedDict
+from typing import List, Dict, Callable, Optional, TypedDict, Any
 
 import pandas as pd
 
-# Type definition for the state of a single exchange's order book level for a given trading pair
+# Type definitions
 Ticker = TypedDict('Ticker', {
-    'bid':       Optional[float],
-    'ask':       Optional[float],
-    'bid_size':  Optional[float],
-    'ask_size':  Optional[float],
+    'bid': Optional[float], 'ask': Optional[float],
+    'bid_size': Optional[float], 'ask_size': Optional[float],
     'funding_rate': Optional[float]
 })
-
-# Type alias for Positions structure
-Positions = Dict[str, Dict[str, float]] # {venue: {coin: balance}}
-
-# --- More descriptive type aliases for Ticker structure --- 
-PairTickerMap = Dict[str, Ticker]           # Maps pair string to Ticker data
-VenueTickerMap = Dict[str, PairTickerMap]   # Maps venue string to PairTickerMap
-# --- --- --- 
-
-# Type definition for a single trade leg in an arbitrage strategy
+Positions = Dict[str, Dict[str, float]]  # {venue: {asset: balance}}
 Trade = TypedDict('Trade', {
-    'pair':      str,
-    'venue':     str,
-    'side':      str,  # 'buy' or 'sell'
-    'price':     float,
-    'volume':    float,
-    'fee':       float,
+    'pair': str, 'venue': str, 'side': str,
+    'price': float, 'volume': float, 'fee': float,
+    'ts_ns': Optional[float], 'type': str  # 'spot','perp'
+})
+
+Event = TypedDict('Event', {
     'ts_ns': Optional[float],
-    'type': str # 'spot' or 'perp'
+    'type': str,  # 'trade', 'funding'
+    'data': Dict[str, Any]  # trade data or funding data
 })
 
 class State:
-    """
-    State class representing the current state of the market and positions.
-    """
-    def __init__(self, tickers: VenueTickerMap, positions: Positions):
+    def __init__(self, tickers: Dict[str, Dict[str, Ticker]], positions: Positions):
         self.tickers = tickers
         self.positions = positions
 
     def __str__(self) -> str:
-        """
-        Format the state as a readable string for debugging.
-        """
-        lines = []
-        lines.append("State:")
-        
-        # Format positions
-        lines.append("  Positions:")
-        for venue, assets in self.positions.items():
-            lines.append(f"    {venue}:")
-            for asset, balance in assets.items():
-                lines.append(f"      {asset}: {balance:,.8f}")
-        
-        # Format tickers
-        lines.append("  Tickers:")
-        for venue, pairs in self.tickers.items():
-            lines.append(f"    {venue}:")
-            for pair, ticker in pairs.items():
-                bid = ticker.get('bid', 'None')
-                ask = ticker.get('ask', 'None')
-                bid_sz = ticker.get('bid_size', 'None')
-                ask_sz = ticker.get('ask_size', 'None')
-                funding = ticker.get('funding_rate', 'None')
-                lines.append(f"      {pair}:")
-                lines.append(f"        bid: {bid:,.8f} x {bid_sz:,.8f}")
-                lines.append(f"        ask: {ask:,.8f} x {ask_sz:,.8f}")
-                if funding != 'None':
-                    lines.append(f"        funding: {funding:,.8f}")
-        
+        lines = ['State:']
+        lines.append('  Positions:')
+        for v, assets in self.positions.items():
+            lines.append(f'    {v}: {assets}')
+        lines.append('  Tickers:')
+        for v, pairs in self.tickers.items():
+            lines.append(f'    {v}:')
+            for p, t in pairs.items():
+                lines.append(
+                    f'      {p} | bid={t.get("bid")} x{t.get("bid_size")} ; '
+                    f'ask={t.get("ask")} x{t.get("ask_size")} ; '
+                    f'funding={t.get("funding_rate")}')
         return "\n".join(lines)
 
-
 def load_parquet_directory(path: Path) -> pd.DataFrame:
-    """
-    Load all Parquet files under `path`, concatenate, sort by ts_ns, and return.
-    Expects columns: ts_ns, venue, pair, bid, ask, bid_size, ask_size, [funding_rate].
-    """
-    files = list(path.glob("*.parquet"))
+    files = list(path.glob('*.parquet'))
     if not files:
-        raise FileNotFoundError(f"No Parquet files in {path}")
+        raise FileNotFoundError(f'No Parquet files in {path}')
     df = pd.concat((pd.read_parquet(f) for f in files), ignore_index=True)
-    df = df.sort_values("ts_ns").reset_index(drop=True)
+    df = df.sort_values('ts_ns').reset_index(drop=True)
     return df
-
 
 class Backtester:
     def __init__(
         self,
         data: pd.DataFrame,
-        initial_positions: Dict[str, Dict[str, float]],
+        initial_positions: Positions,
         strategy: Callable[[State], List[Trade]]
     ):
-        """
-        :param data: historical DataFrame with ts_ns and BBO columns
-        :param initial_positions: {{venue: {{asset: balance}}}}
-        :param strategy: function(state) -> List[Trade]
-        """
         self.data = data.copy()
         self.positions = {v: assets.copy() for v, assets in initial_positions.items()}
         self.strategy = strategy
-        self.trades: List[Trade] = []
-        # initialize state using the exact State TypedDict
-        self.state: State = State(tickers={}, positions=self.positions)
+        self.events: List[Event] = []
+        self.state = State(tickers={}, positions=self.positions)
+        # funding schedule: hourly
+        self.funding_interval_ns = int(3600 * 1e9)
+        first_ts = self.data['ts_ns'].iloc[0]
+        self.next_funding_ts = ((first_ts // self.funding_interval_ns) + 1) * self.funding_interval_ns
 
     def _update_book(self, rec: pd.Series) -> None:
-        venue = rec["venue"]
-        pair = rec["pair"]
-        # Ticker dict matches strategies.py Ticker TypedDict
+        venue, pair = rec['venue'], rec['pair']
         ticker: Ticker = {
-            "bid":          rec["bid"],
-            "ask":          rec["ask"],
-            "bid_size":     rec.get("bid_size"),
-            "ask_size":     rec.get("ask_size"),
-            "funding_rate": rec.get("funding_rate")
+            'bid': rec['bid'], 'ask': rec['ask'],
+            'bid_size': rec.get('bid_size'), 'ask_size': rec.get('ask_size'),
+            'funding_rate': rec.get('funding_rate')
         }
         self.state.tickers.setdefault(venue, {})[pair] = ticker
 
     def _execute_trade(self, t: Trade) -> None:
-        venue = t["venue"]
-        pair  = t["pair"]
-        side  = t["side"]
-        price = t["price"]
-        vol   = t["volume"]
-        fee   = t["fee"]
-        trade_type = t["type"]
-        
-        if trade_type == "spot":
-            base, quote = pair.split("/")
+        venue, pair = t['venue'], t['pair']
+        side, price, vol, fee = t['side'], t['price'], t['volume'], t['fee']
+        acct = self.positions.setdefault(venue, {})
+        if t['type'] == 'spot':
+            base, quote = pair.split('/')
+        else:  # perp
+            base, quote = pair, 'USDC'
+        acct.setdefault(base, 0.0); acct.setdefault(quote, 0.0)
+        if side == 'buy':
+            acct[quote] -= price * vol + fee
+            acct[base]  += vol
         else:
-            base = pair
-            quote = "USDC"
+            acct[base]  -= vol
+            acct[quote] += price * vol - fee
+        self.events.append(Event({
+            'ts_ns': t['ts_ns'],
+            'type': 'trade',
+            'data': dict(t)  # Convert Trade to dict
+        }))
 
-        # ensure positions entry exists
-        bal = self.positions.setdefault(venue, {})
-        bal.setdefault(base,  0.0)
-        bal.setdefault(quote, 0.0)
-
-        if side == "buy":
-            bal[quote] -= price * vol + fee
-            bal[base]  += vol
-        else:  # sell
-            bal[base]  -= vol
-            bal[quote] += price * vol - fee
-
-        # record executed trade leg
-        self.trades.append(t)
+    def _accrue_funding(self) -> None:
+        # apply funding to USDC balances at scheduled times
+        for venue, assets in self.positions.items():
+            for pair, pos_qty in list(assets.items()):
+                if not pair.endswith('-PERP') or pos_qty == 0:
+                    continue
+                tick = self.state.tickers.get(venue, {}).get(pair, {})
+                rate = tick.get('funding_rate') or 0.0
+                price = tick.get('bid') if pos_qty < 0 else tick.get('ask')
+                if price is None:
+                    continue
+                pnl = -pos_qty * price * rate
+                assets['USDC'] = assets.get('USDC', 0.0) + pnl
+                # Record funding as an event
+                self.events.append(Event({
+                    'ts_ns': self.next_funding_ts,
+                    'type': 'funding',
+                    'data': {
+                        'venue': venue,
+                        'pair': pair,
+                        'position': pos_qty,
+                        'rate': rate,
+                        'price': price,
+                        'pnl': pnl
+                    }
+                }))
 
     def run(self) -> pd.DataFrame:
-        """
-        Iterate over each row in historical data, update orderbook,
-        invoke strategy, and execute any returned trades.
-        Returns a DataFrame of all executed Trade records.
-        """
+        initial_usdc = sum(acct.get('USDC', 0.0) for acct in self.positions.values())
+        events = []
+        
         for _, row in self.data.iterrows():
-            # update book state for this tick
+            # accrue any due funding
+            while row['ts_ns'] >= self.next_funding_ts:
+                self._accrue_funding()
+                self.next_funding_ts += self.funding_interval_ns
+            # update orderbook and apply strategy
             self._update_book(row)
-            # call strategy with current state
             new_trades = self.strategy(self.state)
             for t in new_trades:
-                # stamp execution time
-                t["ts_ns"] = row["ts_ns"]
+                t['ts_ns'] = row['ts_ns']
                 self._execute_trade(t)
-        # return trades log as DataFrame
-        return pd.DataFrame(self.trades)
+                # Record USDC balance after each event
+                current_usdc = sum(acct.get('USDC', 0.0) for acct in self.positions.values())
+                events.append({
+                    'ts_ns': row['ts_ns'],
+                    'type': 'trade',
+                    'usdc_balance': current_usdc,
+                    'pnl': current_usdc - initial_usdc
+                })
+        
+        # Convert to DataFrame
+        df = pd.DataFrame(events)
+        if not df.empty:
+            df = df.sort_values('ts_ns')
+        return df
 
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run backtest on historical Parquet files.")
-    parser.add_argument(
-        "--path", required=True,
-        help="Directory containing Parquet files"
-    )
-    parser.add_argument(
-        "--strategy", required=True,
-        help="Name of strategy function in strategies.py"
-    )
-    parser.add_argument(
-        "--initial", nargs=2, action="append", metavar=("VENUE","ASSETS"),
-        help="Initial positions as VENUE 'asset:amt,asset:amt'", default=[]
-    )
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Run backtest')
+    parser.add_argument('--path', required=True)
+    parser.add_argument('--strategy', required=True)
+    parser.add_argument('--initial', nargs=2, action='append', default=[])
     args = parser.parse_args()
 
-    # load historical data
-    df = load_parquet_directory(Path(f"data/{args.path}"))
-
-    # parse initial positions
+    data = load_parquet_directory(Path(f"data/{args.path}"))
     initial = {}
-    for venue, asset_str in args.initial:
-        d = {}
-        for pair in asset_str.split(','):
-            token, amt = pair.split(':')
-            d[token] = float(amt)
-        initial[venue] = d
-
-    # dynamic strategy import
+    for venue, s in args.initial:
+        parts = s.split(',')
+        balances = {token: float(amt) for token, amt in (p.split(':') for p in parts)}
+        initial[venue] = balances
     mod = importlib.import_module('strategies')
-    if not hasattr(mod, args.strategy):
-        raise AttributeError(f"Strategy '{args.strategy}' not found")
-    strat_fn = getattr(mod, args.strategy)
-
-    # run backtest
-    bt = Backtester(df, initial, strat_fn)
-    results = bt.run()
-    print(results)
-
+    strat = getattr(mod, args.strategy)
+    bt = Backtester(data, initial, strat)
+    result = bt.run()
+    print(result)
